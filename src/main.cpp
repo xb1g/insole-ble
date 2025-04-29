@@ -3,28 +3,51 @@
 #include <BLEUtils.h>
 #include <BLE2902.h> // Needed for notifications
 #include <Arduino.h>
-#include <esp_sleep.h> // Needed for deep sleep
 
 // --- Configuration ---
 #define bleServerName "ESP32_RightFoot" // Name seen during BLE scan
 
-// *** CRITICAL: VERIFY PINS FOR YOUR BOARD ***
-// Use ADC1 pins. Common choices: 32, 33, 34, 35, 36, 39.
-// Avoid ADC2 pins if using WiFi (not used here, but good practice).
-// Avoid pins used for Flash (usually 6, 7, 8, 9, 10, 11).
-// Avoid pins used for default Serial (1, 3).
-const int analogPins[] = {1,2,3,4,5,6,7,8}; // EXAMPLE: Using 4 common ADC1 pins
-// const int analogPins[] = {34, 35, 32, 33, 36, 39}; // EXAMPLE: Using 6 common ADC1 pins
+// *** CRITICAL: VERIFY PINS FOR YOUR SPECIFIC ESP32 BOARD ***
+// This maps common Arduino-style labels (A0-A5, A8, A9) to ESP32 GPIO numbers.
+// Double-check your board's pinout diagram!
+//
+// COMMON MAPPINGS:
+// A0 = GPIO 36 (ADC1_CH0) - Input only
+// A1 = GPIO 37 (ADC1_CH1) - Input only, *often missing*
+// A2 = GPIO 38 (ADC1_CH2) - Input only, *often missing*
+// A3 = GPIO 39 (ADC1_CH3) - Input only
+// A4 = GPIO 32 (ADC1_CH4)
+// A5 = GPIO 33 (ADC1_CH5)
+// A6 = GPIO 34 (ADC1_CH6) - Input only
+// A7 = GPIO 35 (ADC1_CH7) - Input only
+// A8 = GPIO 4  (ADC2_CH0) - !!! ADC2 !!!
+// A9 = GPIO 0  (ADC2_CH1) - !!! ADC2 + BOOT PIN !!!
+//
+// !!! WARNINGS !!!
+// 1. ADC2 PINS (GPIO 0, 2, 4, 12-15, 25-27): Cannot be used with analogRead()
+//    while WiFi is active. This code doesn't use WiFi, but be aware.
+// 2. GPIO 0 (A9 / ADC2_CH1): Is a strapping pin (BOOT). Connecting sensors
+//    here can interfere with booting/flashing if it pulls the pin LOW.
+//    *Strongly recommended to avoid GPIO 0 if possible.*
+// 3. GPIOs 37, 38 (A1, A2): May not exist on your board. Check pinout.
+//
+// USING: A0, A3, A4, A5, A8, A9 (Skipping potentially missing A1, A2)
+const int analogPins[] = {
+    1, // A3 (ADC1)
+    2, // A4 (ADC1)
+    3, // A5 (ADC1)
+    4,  // A8 (ADC2 - Warning: WiFi conflict potential)
+    5,   // A9 (ADC2 - Warning: WiFi conflict + BOOT PIN)
+    6,   // A9 (ADC2 - Warning: WiFi conflict + BOOT PIN)
+    7,
+    8,   // A9 (ADC2 - Warning: WiFi conflict + BOOT PIN)
+};
 const int numPins = sizeof(analogPins) / sizeof(analogPins[0]);
 
 // --- Power Saving Configuration ---
-#define DEBUG // Comment out to disable Serial prints for max power saving
-const uint64_t WAKE_INTERVAL_US = 1 * 1000 * 1000; // Wake up every 1 second (in microseconds)
-const uint32_t INACTIVITY_TIMEOUT_MS = 60 * 1000; // Go to sleep after 1 minute of inactivity (in milliseconds)
+// #define DEBUG // Comment out to disable Serial prints for max power saving
+// Remove WAKE_INTERVAL_US and INACTIVITY_TIMEOUT_MS, no sleep needed
 const uint16_t CHANGE_THRESHOLD = 20; // Minimum change in ADC value to be considered "significant"
-// Optional: Reduce CPU Frequency for power saving (80MHz is often lowest stable)
-// Requires #include <soc/soc.h>, #include <soc/rtc_cntl_reg.h>
-// Set in setup(): WRITE_PERI_REG(RTC_CNTL_CLK_CONF_REG, (READ_PERI_REG(RTC_CNTL_CLK_CONF_REG) & 0xffffff00) | 0x01); // 80MHz XTAL
 
 // --- BLE Configuration ---
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914c" // Keep same UUIDs if client expects them
@@ -35,23 +58,31 @@ BLECharacteristic *pAnalogCharacteristic = nullptr; // Initialize pointer
 BLEServer *pServer = nullptr;                     // Initialize pointer
 bool deviceConnected = false;
 bool bleInitialized = false; // Track if BLE stack needs full init
-uint32_t lastSignificantChangeTime = 0;
+// Remove lastSignificantChangeTime and INACTIVITY_TIMEOUT_MS, no inactivity timer needed
 uint32_t lastSendTime = 0;
 const long sendInterval = 1000; // Send data interval when connected and active (ms)
+uint32_t lastAdvertiseTime = 0; // For BLE reconnect interval
 
 // Store the last readings that were considered significant
 uint16_t lastSignificantReadings[numPins];
 
+// Add for LED breathing
+bool breathing = false;
+uint32_t lastBreathUpdate = 0;
+int breathBrightness = 0;
+int breathDirection = 1; // 1 = brighter, -1 = dimmer
+
 // --- BLE Server Callbacks ---
 class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServerInstance) { // Renamed pServer to avoid conflict
+    void onConnect(BLEServer* pServerInstance) {
         deviceConnected = true;
         #ifdef DEBUG
         Serial.println("Device connected");
         #endif
-        // Optional: Update connection parameters for lower power when connected
-        // Example: Slower interval, higher latency tolerance
-        // pServerInstance->updateConnParams(pServerInstance->getConnId(), 0x30, 0x30, 0, 400); // 60ms interval, 4s timeout
+        // Start breathing effect
+        breathing = true;
+        // Ensure LED is ON at start of breathing
+        analogWrite(LED_BUILTIN, 0);
     }
 
     void onDisconnect(BLEServer* pServerInstance) {
@@ -59,15 +90,16 @@ class MyServerCallbacks : public BLEServerCallbacks {
         #ifdef DEBUG
         Serial.println("Device disconnected");
         #endif
-        // Advertising should restart automatically when we wake up if needed
-        // If woken by timer and were disconnected, loop logic will restart it.
+        // Stop breathing effect, turn off LED
+        breathing = false;
+        analogWrite(LED_BUILTIN, 0);
     }
 };
 
 // --- Function Declarations ---
 void initBLE();
-void goToDeepSleep();
 bool checkSignificantChange(uint16_t currentReadings[]);
+int readAnalogPin(int pin); // Helper for potential ADC2 workaround
 
 // --- Setup ---
 void setup() {
@@ -77,54 +109,41 @@ void setup() {
     Serial.println("Starting ESP32 BLE Analog Server (Optimized)...");
     #endif
 
-    // Optional: Reduce CPU frequency (uncomment include directives above too)
-    // WRITE_PERI_REG(RTC_CNTL_CLK_CONF_REG, (READ_PERI_REG(RTC_CNTL_CLK_CONF_REG) & 0xffffff00) | 0x01); // Set CPU to 80MHz
+    // Initialize LED_BUILTIN
+    pinMode(LED_BUILTIN, OUTPUT);
+    analogWrite(LED_BUILTIN, 0);
 
     // Configure ADC
     // analogReadResolution(12); // Default is 12-bit
-    // analogSetAttenuation(ADC_11db); // Default is 11dB
+    // analogSetAttenuation(ADC_11db); // Default is 11dB (adjust per pin if needed)
+    // Example: Set attenuation for specific pins if voltage range differs
+    // adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11); // GPIO 36 (A0)
+    // adc2_config_channel_atten(ADC2_CHANNEL_0, ADC_ATTEN_DB_11); // GPIO 4 (A8) - Note ADC2
 
     #ifdef DEBUG
-    Serial.print("Configured ADC Pins: ");
+    Serial.print("Configured ADC Pins (GPIO Numbers): ");
     for(int i=0; i<numPins; i++) {
         Serial.print(analogPins[i]);
         if (i < numPins - 1) Serial.print(", ");
     }
     Serial.println();
+    Serial.println("!!! Verify these GPIO numbers match your board's A0-A5, A8, A9 labels !!!");
+    Serial.println("!!! WARNING: Pins 4 (A8) and 0 (A9) are ADC2. May conflict with WiFi. Pin 0 is BOOT pin. !!!");
     #endif
 
     // Initialize last readings (read once)
     for (int i = 0; i < numPins; i++) {
-        lastSignificantReadings[i] = analogRead(analogPins[i]);
+        pinMode(analogPins[i], INPUT);
+        lastSignificantReadings[i] = readAnalogPin(analogPins[i]);
     }
-    lastSignificantChangeTime = millis(); // Assume initial state is "active"
+    // Remove lastSignificantChangeTime = millis();
 
-    // Check wake-up reason
-    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    // Remove wake-up reason and deep sleep timer config
+    // Always initialize BLE on boot
+    initBLE();
 
-    if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
-        // First boot or wake from other source (not timer)
-        #ifdef DEBUG
-        Serial.println("Woke up from reset or non-timer event. Initializing BLE.");
-        #endif
-        initBLE(); // Full BLE initialization
-    } else {
-        // Woke up from timer (deep sleep)
-        #ifdef DEBUG
-        Serial.println("Woke up from timer deep sleep.");
-        #endif
-        // BLE might still be advertising or connected if the sleep was short,
-        // but often the connection is lost. We'll check connection status
-        // and restart advertising if needed in the loop.
-        // Re-init BLE objects, but not device itself.
-        initBLE(); // Re-initialize server/service/characteristic pointers and start service
-    }
-
-    // Configure deep sleep timer wake-up
-    esp_sleep_enable_timer_wakeup(WAKE_INTERVAL_US);
     #ifdef DEBUG
-    Serial.printf("Wake timer set to %llu us.\n", WAKE_INTERVAL_US);
-    Serial.printf("Inactivity timeout set to %lu ms.\n", INACTIVITY_TIMEOUT_MS);
+    Serial.println("BLE initialized on boot.");
     Serial.printf("Change threshold set to %u.\n", CHANGE_THRESHOLD);
     #endif
 }
@@ -135,9 +154,42 @@ void loop() {
     uint16_t currentReadings[numPins];
     bool significantChangeDetected = false;
 
+    // --- LED Handling ---
+    if (!deviceConnected) {
+        // Blink rapidly while advertising (trying to connect)
+        static uint32_t lastBlink = 0;
+        static bool ledState = false;
+        if (currentMillis - lastBlink > 200) {
+            ledState = !ledState;
+            digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+            lastBlink = currentMillis;
+        }
+    } else if (breathing) {
+        // Slow breathing effect when connected
+        if (currentMillis - lastBreathUpdate > 10) {
+            // Breath period: ~3s up, ~3s down (adjust step for slower/faster)
+            breathBrightness += breathDirection;
+            if (breathBrightness >= 255) {
+                breathBrightness = 255;
+                breathDirection = -1;
+            } else if (breathBrightness <= 0) {
+                breathBrightness = 0;
+                breathDirection = 1;
+            }
+            analogWrite(LED_BUILTIN, breathBrightness);
+            lastBreathUpdate = currentMillis;
+        }
+    }
+
     // 1. Read current sensor values
     for (int i = 0; i < numPins; i++) {
-        currentReadings[i] = analogRead(analogPins[i]);
+        currentReadings[i] = readAnalogPin(analogPins[i]);
+        if (currentReadings[i] == -1) {
+             #ifdef DEBUG
+             Serial.printf("Warning: Failed to read ADC pin %d (Likely ADC2 conflict if WiFi was active)\n", analogPins[i]);
+             #endif
+             currentReadings[i] = lastSignificantReadings[i];
+        }
     }
 
     // 2. Check for significant change
@@ -145,126 +197,133 @@ void loop() {
 
     if (significantChangeDetected) {
         #ifdef DEBUG
-        Serial.print("Significant change detected. Readings: ");
+        Serial.print("Significant change detected. Readings (GPIO:Value): ");
         for(int i=0; i<numPins; i++) Serial.printf("[%d]:%d ", analogPins[i], currentReadings[i]);
         Serial.println();
         #endif
-        // Update last significant readings and reset inactivity timer
         memcpy(lastSignificantReadings, currentReadings, sizeof(lastSignificantReadings));
-        lastSignificantChangeTime = currentMillis;
+        // Remove lastSignificantChangeTime = currentMillis;
     }
 
     // 3. Handle BLE Connection and Sending Data
     if (deviceConnected) {
-        // Send data periodically ONLY if connected
         if (currentMillis - lastSendTime >= sendInterval) {
             lastSendTime = currentMillis;
-
-            // Prepare buffer (use last significant readings)
             uint8_t dataBuffer[numPins * 2];
             for (int i = 0; i < numPins; i++) {
-                dataBuffer[i * 2]     = lastSignificantReadings[i] & 0xFF;        // Low byte
-                dataBuffer[i * 2 + 1] = (lastSignificantReadings[i] >> 8) & 0xFF; // High byte
+                dataBuffer[i * 2]     = lastSignificantReadings[i] & 0xFF;
+                dataBuffer[i * 2 + 1] = (lastSignificantReadings[i] >> 8) & 0xFF;
             }
-
-            if (pAnalogCharacteristic != nullptr) { // Check if characteristic exists
+            if (pAnalogCharacteristic != nullptr) {
                  pAnalogCharacteristic->setValue(dataBuffer, sizeof(dataBuffer));
                  pAnalogCharacteristic->notify();
-                 #ifdef DEBUG
-                 Serial.printf("Sent %d bytes via BLE notification.\n", sizeof(dataBuffer));
-                 #endif
             } else {
                  #ifdef DEBUG
-                 Serial.println("Error: pAnalogCharacteristic is null!");
+                 Serial.println("Error: pAnalogCharacteristic is null! Cannot send.");
                  #endif
             }
         }
     } else {
-        // Not connected. Ensure advertising is running if BLE is initialized.
-        // The BLE stack might handle restarts, but explicit check is safer after sleep.
+        // Not connected. Ensure advertising is running every second if BLE is initialized.
         if (bleInitialized && pServer != nullptr) {
-            // Ensure advertising is running if BLE is initialized
-            BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-            #ifdef DEBUG
-            Serial.println("Device not connected, starting advertising...");
-            #endif
-            pAdvertising->start(); // Directly start advertising (idempotent)
+            if (currentMillis - lastAdvertiseTime >= 1000) {
+                BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+                #ifdef DEBUG
+                Serial.println("Device not connected, (re)starting advertising...");
+                #endif
+                pAdvertising->start();
+                lastAdvertiseTime = currentMillis;
+            }
+        } else if (!bleInitialized) {
+             #ifdef DEBUG
+             Serial.println("BLE not initialized, cannot advertise yet.");
+             #endif
         }
     }
 
-    // 4. Check for Inactivity and Go to Sleep
-    if (currentMillis - lastSignificantChangeTime > INACTIVITY_TIMEOUT_MS) {
-        #ifdef DEBUG
-        Serial.printf("No significant change for %lu ms. Entering deep sleep.\n", INACTIVITY_TIMEOUT_MS);
-        #endif
-        goToDeepSleep();
-    }
+    // Remove inactivity/sleep logic
 
-    // Yield for background tasks (like BLE stack) - important!
-    // A small delay can sometimes help stability, but yield() is preferred.
     yield();
-    // delay(10); // Use yield() instead if possible
 }
 
 // --- Helper Functions ---
 
+// Wrapper for analogRead, handles ADC2 potential issues (returns -1 on error)
+int readAnalogPin(int pin) {
+    // Simple approach for this code (no WiFi): just use analogRead
+     return analogRead(pin);
+
+    // If WiFi WAS active, you'd need a more complex check using adc2_get_raw():
+    /*
+    int reading = -1;
+    adc2_channel_t channel;
+    if (digitalPinToAnalogChannel(pin) >= SOC_ADC_MAX_CHANNEL_NUM) { // Check if it's an ADC2 pin
+        // Convert GPIO to ADC2 channel
+        if (adc2_pad_get_io_num((adc2_channel_t)digitalPinToAnalogChannel(pin), &channel) == ESP_OK) {
+             esp_err_t err = adc2_get_raw(channel, ADC_WIDTH_BIT_12, &reading);
+             if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_STATE) {
+                 // ADC2 is busy (likely WiFi) or not calibrated
+                 return -1; // Indicate error
+             } else if (err != ESP_OK) {
+                 // Other ADC error
+                 return -1;
+             }
+        } else {
+            return -1; // Invalid GPIO for ADC2
+        }
+    } else {
+        // It's an ADC1 pin
+        reading = analogRead(pin);
+    }
+    return reading;
+    */
+}
+
+
 bool checkSignificantChange(uint16_t currentReadings[]) {
     for (int i = 0; i < numPins; i++) {
-        // Use abs() for difference calculation
-        if (abs((int16_t)currentReadings[i] - (int16_t)lastSignificantReadings[i]) > CHANGE_THRESHOLD) {
+        // Use abs() for difference calculation, cast to signed int to handle wrap-around correctly
+        if (abs((int32_t)currentReadings[i] - (int32_t)lastSignificantReadings[i]) > CHANGE_THRESHOLD) {
             return true; // Significant change detected
         }
     }
     return false; // No significant change
 }
 
-void goToDeepSleep() {
-    #ifdef DEBUG
-    Serial.flush(); // Ensure serial messages are sent before sleeping
-    #endif
-
-    // Stop advertising before sleeping
-    if (bleInitialized) {
-         BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-         pAdvertising->stop(); // Directly stop advertising
-         #ifdef DEBUG
-         Serial.println("Stopped BLE advertising.");
-         #endif
-         // Optional: Disconnect client explicitly? Deep sleep usually breaks it anyway.
-         // if(deviceConnected && pServer != nullptr) {
-         //    pServer->disconnect(pServer->getConnId());
-         // }
-    }
-
-    #ifdef DEBUG
-    Serial.println("Going to sleep now.");
-    delay(100); // Short delay to allow serial flush again
-    #endif
-
-    esp_deep_sleep_start();
-}
-
 void initBLE() {
-    if (bleInitialized) {
-        // If already initialized (e.g., wake from sleep),
-        // we might just need to restart services/advertising if needed.
-        // However, pointers might be invalid after sleep. Re-creating seems safer.
-        // Clean up previous objects if they exist (optional, depends on BLE library internals)
-        // BLEDevice::deinit(true); // Full deinit - might be too aggressive
-    }
+    // Simple re-init approach for wake-from-sleep:
+    // Assume previous objects are invalid/stale after sleep.
+    // The BLEDevice state might persist partially, but server/service/char likely need recreation.
 
-    // Initialize BLE Device (only once ideally, but safe to call again)
+    // If BLE stack was truly running before sleep, a full deinit might be cleaner,
+    // but can sometimes cause issues. Let's try re-creating objects directly.
+    // if (bleInitialized && pServer != nullptr) {
+        // Maybe clean up?
+        // delete pServer; // Risky if callbacks are still somehow active
+        // pServer = nullptr;
+        // pAnalogCharacteristic = nullptr; // Pointer is now invalid anyway
+        // BLEDevice::deinit(false); // Gentle deinit?
+    // }
+
+    // Ensure core BLE Device is initialized
     if (!BLEDevice::getInitialized()) { // Check if core BLE is initialized
          BLEDevice::init(bleServerName);
           // Optional: Set lower BLE transmit power (saves power, reduces range)
          // Options: ESP_PWR_LVL_N12, N9, N6, N3, N0, P3, P6, P9 (default P3)
          // BLEDevice::setPower(ESP_PWR_LVL_N6); // Example: -6dBm
+         #ifdef DEBUG
+         Serial.println("BLEDevice initialized.");
+         #endif
+    } else {
+         #ifdef DEBUG
+         Serial.println("BLEDevice already initialized.");
+         #endif
     }
 
-
-    // Create the BLE Server
+    // Create the BLE Server (or get existing if library handles persistence?)
+    // Safer to assume we need to create it again after sleep.
     pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
+    pServer->setCallbacks(new MyServerCallbacks()); // Create NEW callback object
 
     // Create the BLE Service
     BLEService *pService = pServer->createService(SERVICE_UUID);
@@ -276,6 +335,7 @@ void initBLE() {
                               BLECharacteristic::PROPERTY_NOTIFY
                             );
 
+    // Add the CCCD descriptor for notifications
     pAnalogCharacteristic->addDescriptor(new BLE2902()); // Essential for notifications
 
     // Start the service
@@ -285,16 +345,16 @@ void initBLE() {
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06); // Helps iOS/connection reliability
+    pAdvertising->setMinPreferred(0x06); // Helps iOS/connection reliability (Continuity Info)
     // Consider longer advertising intervals for power saving if discovery speed isn't critical
     // pAdvertising->setMinInterval(0x80); // Example: 80 * 0.625ms = 50ms
     // pAdvertising->setMaxInterval(0x100); // Example: 160 * 0.625ms = 100ms
 
-    // Don't start advertising here directly, let the loop handle it based on connection status.
-    bleInitialized = true;
+    // Don't start advertising here. Let the loop handle it based on connection status.
+    bleInitialized = true; // Mark BLE setup as complete for this wake cycle
 
     #ifdef DEBUG
-    Serial.println("BLE Initialized/Re-initialized.");
+    Serial.println("BLE Server/Service/Characteristic Initialized/Re-initialized.");
     Serial.printf("Connect to '%s'\n", bleServerName);
     Serial.printf("Service UUID: %s\n", SERVICE_UUID);
     Serial.printf("Characteristic UUID: %s\n", CHARACTERISTIC_UUID);
