@@ -45,7 +45,7 @@ const int analogPins[] = {
 const int numPins = sizeof(analogPins) / sizeof(analogPins[0]);
 
 // --- Power Saving Configuration ---
-// #define DEBUG // Comment out to disable Serial prints for max power saving
+#define DEBUG // Comment out to disable Serial prints for max power saving
 // Remove WAKE_INTERVAL_US and INACTIVITY_TIMEOUT_MS, no sleep needed
 const uint16_t CHANGE_THRESHOLD = 20; // Minimum change in ADC value to be considered "significant"
 
@@ -53,6 +53,26 @@ const uint16_t CHANGE_THRESHOLD = 20; // Minimum change in ADC value to be consi
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914c" // Keep same UUIDs if client expects them
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9"
 
+// --- Buzzer Configuration ---
+#define isRight  // Define this only for the right insole
+#define BUZZER_PIN 9
+#define BUZZER_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26aa"
+
+#ifdef isRight
+// --- Buzzer Callbacks ---
+class BuzzerCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string rxValue = pCharacteristic->getValue();
+        if (rxValue.length() > 0) {
+            if (rxValue[0] == 0x01) {
+                digitalWrite(BUZZER_PIN, HIGH);  // Turn buzzer on
+            } else if (rxValue[0] == 0x00) {
+                digitalWrite(BUZZER_PIN, LOW);   // Turn buzzer off
+            }
+        }
+    }
+};
+#endif
 // --- Global Variables ---
 BLECharacteristic *pAnalogCharacteristic = nullptr; // Initialize pointer
 BLEServer *pServer = nullptr;                     // Initialize pointer
@@ -60,7 +80,7 @@ bool deviceConnected = false;
 bool bleInitialized = false; // Track if BLE stack needs full init
 // Remove lastSignificantChangeTime and INACTIVITY_TIMEOUT_MS, no inactivity timer needed
 uint32_t lastSendTime = 0;
-const long sendInterval = 1000; // Send data interval when connected and active (ms)
+const long sendInterval = 500; // Send data interval when connected and active (ms)
 uint32_t lastAdvertiseTime = 0; // For BLE reconnect interval
 
 // Store the last readings that were considered significant
@@ -71,6 +91,55 @@ bool breathing = false;
 uint32_t lastBreathUpdate = 0;
 int breathBrightness = 0;
 int breathDirection = 1; // 1 = brighter, -1 = dimmer
+
+// --- Queue Configuration ---
+#define QUEUE_SIZE 10  // Number of readings to buffer for smoothing
+typedef struct {
+    uint16_t readings[numPins];
+} SensorReading;
+
+SensorReading readingQueue[QUEUE_SIZE];
+int queueHead = 0;  // Index to read from
+int queueTail = 0;  // Index to write to
+int queueCount = 0; // Number of items currently in queue
+
+// Helper functions for queue operations
+void enqueueReading(const uint16_t* readings) {
+    // Copy readings to the queue
+    memcpy(readingQueue[queueTail].readings, readings, sizeof(uint16_t) * numPins);
+    
+    queueTail = (queueTail + 1) % QUEUE_SIZE;
+    if (queueCount < QUEUE_SIZE) {
+        queueCount++;
+    } else {
+        // Queue is full, move head to discard oldest reading
+        queueHead = (queueHead + 1) % QUEUE_SIZE;
+    }
+}
+
+void calculateAverageReadings(uint16_t* result) {
+    if (queueCount == 0) {
+        memset(result, 0, sizeof(uint16_t) * numPins);
+        return;
+    }
+
+    // Initialize sums
+    uint32_t sums[numPins] = {0};
+    
+    // Sum all readings in the queue
+    int idx = queueHead;
+    for (int i = 0; i < queueCount; i++) {
+        for (int j = 0; j < numPins; j++) {
+            sums[j] += readingQueue[idx].readings[j];
+        }
+        idx = (idx + 1) % QUEUE_SIZE;
+    }
+    
+    // Calculate averages
+    for (int i = 0; i < numPins; i++) {
+        result[i] = sums[i] / queueCount;
+    }
+}
 
 // --- BLE Server Callbacks ---
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -112,6 +181,12 @@ void setup() {
     // Initialize LED_BUILTIN
     pinMode(LED_BUILTIN, OUTPUT);
     analogWrite(LED_BUILTIN, 0);
+
+    #ifdef isRight
+    // Initialize buzzer pin (only for right insole)
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);  // Start with buzzer off
+    #endif
 
     // Configure ADC
     // analogReadResolution(12); // Default is 12-bit
@@ -192,8 +267,15 @@ void loop() {
         }
     }
 
-    // 2. Check for significant change
-    significantChangeDetected = checkSignificantChange(currentReadings);
+    // Add current readings to the queue
+    enqueueReading(currentReadings);
+
+    // Get smoothed readings for comparison and sending
+    uint16_t smoothedReadings[numPins];
+    calculateAverageReadings(smoothedReadings);
+
+    // 2. Check for significant change using smoothed readings
+    significantChangeDetected = checkSignificantChange(smoothedReadings);
 
     if (significantChangeDetected) {
         #ifdef DEBUG
@@ -210,9 +292,11 @@ void loop() {
         if (currentMillis - lastSendTime >= sendInterval) {
             lastSendTime = currentMillis;
             uint8_t dataBuffer[numPins * 2];
+            uint16_t smoothedReadings[numPins];
+            calculateAverageReadings(smoothedReadings);
             for (int i = 0; i < numPins; i++) {
-                dataBuffer[i * 2]     = lastSignificantReadings[i] & 0xFF;
-                dataBuffer[i * 2 + 1] = (lastSignificantReadings[i] >> 8) & 0xFF;
+                dataBuffer[i * 2]     = smoothedReadings[i] & 0xFF;
+                dataBuffer[i * 2 + 1] = (smoothedReadings[i] >> 8) & 0xFF;
             }
             if (pAnalogCharacteristic != nullptr) {
                  pAnalogCharacteristic->setValue(dataBuffer, sizeof(dataBuffer));
@@ -337,6 +421,15 @@ void initBLE() {
 
     // Add the CCCD descriptor for notifications
     pAnalogCharacteristic->addDescriptor(new BLE2902()); // Essential for notifications
+
+    #ifdef isRight
+    // Create buzzer characteristic (only for right insole)
+    BLECharacteristic *pBuzzerCharacteristic = pService->createCharacteristic(
+        BUZZER_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    pBuzzerCharacteristic->setCallbacks(new BuzzerCallbacks());
+    #endif
 
     // Start the service
     pService->start();
