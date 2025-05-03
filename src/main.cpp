@@ -5,7 +5,7 @@
 #include <Arduino.h>
 
 // --- Configuration ---
-#define bleServerName "ESP32_RightFoot" // Name seen during BLE scan
+#define bleServerName "ESP32_LeftFoot" // Name seen during BLE scan
 
 // *** CRITICAL: VERIFY PINS FOR YOUR SPECIFIC ESP32 BOARD ***
 // This maps common Arduino-style labels (A0-A5, A8, A9) to ESP32 GPIO numbers.
@@ -45,7 +45,7 @@ const int analogPins[] = {
 const int numPins = sizeof(analogPins) / sizeof(analogPins[0]);
 
 // --- Power Saving Configuration ---
-#define DEBUG // Comment out to disable Serial prints for max power saving
+// #define DEBUG // Comment out to disable Serial prints for max power saving
 // Remove WAKE_INTERVAL_US and INACTIVITY_TIMEOUT_MS, no sleep needed
 const uint16_t CHANGE_THRESHOLD = 20; // Minimum change in ADC value to be considered "significant"
 
@@ -93,7 +93,7 @@ int breathBrightness = 0;
 int breathDirection = 1; // 1 = brighter, -1 = dimmer
 
 // --- Queue Configuration ---
-#define QUEUE_SIZE 10  // Number of readings to buffer for smoothing
+#define QUEUE_SIZE 15  // Number of readings to buffer for smoothing
 typedef struct {
     uint16_t readings[numPins];
 } SensorReading;
@@ -182,11 +182,16 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     analogWrite(LED_BUILTIN, 0);
 
-    #ifdef isRight
-    // Initialize buzzer pin (only for right insole)
-    pinMode(BUZZER_PIN, OUTPUT);
+    if (bleServerName == "ESP32_RightFoot") {
+        pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, HIGH);  // Start with buzzer off
+    delay(100); // Short delay to ensure buzzer is off
     digitalWrite(BUZZER_PIN, LOW);  // Start with buzzer off
-    #endif
+    } else {
+        #ifdef DEBUG
+        Serial.println("Left insole detected.");
+        #endif
+    }
 
     // Configure ADC
     // analogReadResolution(12); // Default is 12-bit
